@@ -201,6 +201,7 @@ class TestSLAFIterableDataset:
 
         batch = TokenizedPrefetchBatch(
             batch_id=0,
+            epoch=0,
             input_ids=input_ids,
             attention_mask=attention_mask,
             cell_integer_ids=[100, 101],
@@ -222,6 +223,7 @@ class TestSLAFIterableDataset:
 
         batch = TokenizedPrefetchBatch(
             batch_id=1,
+            epoch=0,
             input_ids=input_ids,
             attention_mask=attention_mask,
             cell_integer_ids=[200, 201, 202],
@@ -302,6 +304,60 @@ class TestSLAFIterableDataset:
         assert "total_cells" in stats
         assert "elapsed_time" in stats
         assert "cells_per_sec" in stats
+
+    def test_prefetcher_propagates_worker_failure(self):
+        """Background loading errors must reach the foreground iterator."""
+        processor = Mock()
+        processor.verbose = False
+        processor.n_epochs = 1
+        processor.current_epoch = 0
+        processor.load_prefetch_batch.side_effect = OSError(24, "Too many open files")
+        prefetcher = AsyncPrefetcher(processor, max_queue_size=1)
+        prefetcher.start()
+
+        with pytest.raises(RuntimeError, match="SLAF prefetch worker failed") as error:
+            prefetcher.get_batch(timeout=2.0)
+
+        assert isinstance(error.value.__cause__, OSError)
+        assert error.value.__cause__.errno == 24
+        prefetcher.stop()
+        processor.close.assert_called()
+
+    def test_prefetcher_applies_backpressure_without_dropping_batches(self):
+        """A full queue must block the producer rather than discard its batch."""
+        batches = [
+            TokenizedPrefetchBatch(
+                batch_id=index,
+                epoch=0,
+                input_ids=torch.zeros((1, 2), dtype=torch.long),
+                attention_mask=torch.ones((1, 2), dtype=torch.bool),
+                cell_integer_ids=[index],
+                partial_cell_data={},
+                tokenize_time=0.0,
+            )
+            for index in range(3)
+        ]
+        processor = Mock()
+        processor.verbose = False
+        processor.n_epochs = 1
+        processor.current_epoch = 0
+        processor.load_prefetch_batch.side_effect = [
+            *batches,
+            StopIteration("No more epochs available"),
+        ]
+        prefetcher = AsyncPrefetcher(processor, max_queue_size=1)
+        prefetcher.start()
+
+        observed = []
+        while True:
+            batch = prefetcher.get_batch(timeout=2.0)
+            if batch is None:
+                assert prefetcher.finished
+                break
+            observed.append(batch.batch_id)
+
+        assert observed == [0, 1, 2]
+        prefetcher.stop()
 
     def test_dataset_iteration_geneformer(self, tiny_slaf):
         """Test dataset iteration with Geneformer tokenizer"""
@@ -384,13 +440,19 @@ class TestSLAFIterableDataset:
         batch = next(iter(dataset))
         input_ids = batch["input_ids"]
         values = batch["values"]
+        attention_mask = batch["attention_mask"]
 
         assert values.shape == input_ids.shape
-        cls_positions = input_ids == tokenizer.special_tokens["CLS"]
-        sep_positions = input_ids == tokenizer.special_tokens["SEP"]
         pad_value = tokenizer.special_tokens["PAD"]
-        assert torch.all(values[cls_positions] == pad_value)
-        assert torch.all(values[sep_positions] == pad_value)
+        assert torch.all(input_ids[:, 0] == tokenizer.special_tokens["CLS"])
+        assert torch.all(values[:, 0] == pad_value)
+
+        sep_positions = attention_mask.long().sum(dim=1) - 1
+        row_indices = torch.arange(input_ids.shape[0])
+        assert torch.all(
+            input_ids[row_indices, sep_positions] == tokenizer.special_tokens["SEP"]
+        )
+        assert torch.all(values[row_indices, sep_positions] == pad_value)
 
     def test_device_transfer(self, tiny_slaf):
         """Test device transfer functionality"""
@@ -768,6 +830,7 @@ class TestPrefetchBatchProcessing:
 
         batch = TokenizedPrefetchBatch(
             batch_id=0,
+            epoch=0,
             input_ids=input_ids,
             attention_mask=attention_mask,
             cell_integer_ids=[100, 101],
@@ -933,7 +996,7 @@ class TestPrefetchBatchProcessing:
         assert dataset.batch_processor.prefetch_batch_size == 1048576
 
     def test_mixture_of_scanners_fragment_generators(self, tiny_slaf):
-        """Test that MoS creates the correct number of fragment generators"""
+        """Test that MoS bounds the number of open fragment generators."""
         tokenizer = GeneformerTokenizer(tiny_slaf)
 
         dataset = SLAFIterableDataset(
@@ -945,19 +1008,45 @@ class TestPrefetchBatchProcessing:
             prefetch_batch_size=1048576,
         )
 
-        # Check that fragment generators are created
-        assert hasattr(dataset.batch_processor, "fragment_generators")
-        assert len(dataset.batch_processor.fragment_generators) > 0
+        processor = dataset.batch_processor
+        assert len(processor.fragment_generators) <= processor.n_scanners
+        assert set(processor.generator_last_cells) == set(processor.fragment_generators)
 
-        # Check that generator tracking arrays are created
-        assert hasattr(dataset.batch_processor, "generator_last_cells")
-        assert hasattr(dataset.batch_processor, "generator_active")
-        assert len(dataset.batch_processor.generator_last_cells) == len(
-            dataset.batch_processor.fragment_generators
+    def test_mixture_of_scanners_pool_is_bounded_and_seeded(self, tiny_slaf):
+        """Only n_scanners generators are opened from a seeded fragment order."""
+        tokenizer = GeneformerTokenizer(tiny_slaf)
+        processor = PrefetchBatchProcessor(
+            slaf_array=tiny_slaf,
+            shuffle=RandomShuffle(),
+            tokenizer=tokenizer,
+            use_mixture_of_scanners=True,
+            n_scanners=3,
+            prefetch_batch_size=1000,
         )
-        assert len(dataset.batch_processor.generator_active) == len(
-            dataset.batch_processor.fragment_generators
-        )
+        fake_fragments = [Mock() for _ in range(12)]
+        for fragment in fake_fragments:
+            fragment.to_batches.return_value = iter(())
+        processor.fragments = fake_fragments
+
+        processor._reset_mos_scanners()
+        first_order = list(processor.pending_fragment_indices)
+        processor._reset_mos_scanners()
+        assert list(processor.pending_fragment_indices) == first_order
+
+        processor._fill_scanner_pool()
+        assert len(processor.fragment_generators) == processor.n_scanners
+        assert len(processor.pending_fragment_indices) == 9
+        for generator_idx in list(processor.fragment_generators):
+            processor._release_scanner(generator_idx)
+        processor._fill_scanner_pool()
+        assert len(processor.fragment_generators) == processor.n_scanners
+        assert len(processor.pending_fragment_indices) == 6
+
+        processor.current_epoch = 1
+        processor._reset_mos_scanners()
+        assert list(processor.pending_fragment_indices) != first_order
+        processor.close()
+        assert not processor.fragment_generators
 
     def test_mixture_of_scanners_parameter_validation(self, tiny_slaf):
         """Test MoS parameter validation"""
@@ -1061,18 +1150,14 @@ class TestPrefetchBatchProcessing:
             prefetch_batch_size=1048576,
         )
 
-        # Test epoch reset
+        dataset.close()
         dataset.batch_processor.reset_for_epoch(1)
         assert dataset.batch_processor.current_epoch == 1
         assert dataset.batch_processor.batch_id == 0
 
-        # Check that fragment generators are reinitialized
-        assert len(dataset.batch_processor.fragment_generators) > 0
-        assert len(dataset.batch_processor.generator_last_cells) == len(
-            dataset.batch_processor.fragment_generators
-        )
-        assert len(dataset.batch_processor.generator_active) == len(
-            dataset.batch_processor.fragment_generators
+        assert not dataset.batch_processor.fragment_generators
+        assert len(dataset.batch_processor.pending_fragment_indices) == len(
+            dataset.batch_processor.fragments
         )
 
     def test_mixture_of_scanners_backward_compatibility(self, tiny_slaf):
@@ -1245,15 +1330,10 @@ class TestPrefetchBatchProcessing:
         assert processor.prefetch_batch_size == 1048576
         assert processor.by_fragment is True  # MoS automatically enables fragment mode
 
-        # Check that fragment generators are created
         assert hasattr(processor, "fragment_generators")
-        assert len(processor.fragment_generators) > 0
-
-        # Check that generator tracking arrays are created
         assert hasattr(processor, "generator_last_cells")
-        assert hasattr(processor, "generator_active")
-        assert len(processor.generator_last_cells) == len(processor.fragment_generators)
-        assert len(processor.generator_active) == len(processor.generator_active)
+        assert not processor.fragment_generators
+        assert len(processor.pending_fragment_indices) == len(processor.fragments)
 
     def test_prefetch_batch_processor_mos_parameter_validation(self, tiny_slaf):
         """Test MoS parameter validation in PrefetchBatchProcessor"""
@@ -1339,10 +1419,8 @@ class TestPrefetchBatchProcessing:
         assert processor.current_epoch == 1
         assert processor.batch_id == 0
 
-        # Check that fragment generators are reinitialized
-        assert len(processor.fragment_generators) > 0
-        assert len(processor.generator_last_cells) == len(processor.fragment_generators)
-        assert len(processor.generator_active) == len(processor.fragment_generators)
+        assert not processor.fragment_generators
+        assert len(processor.pending_fragment_indices) == len(processor.fragments)
 
     def test_prefetch_batch_processor_mos_backward_compatibility(self, tiny_slaf):
         """Test that MoS is backward compatible (enabled by default) in PrefetchBatchProcessor"""

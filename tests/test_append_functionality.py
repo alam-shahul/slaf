@@ -21,6 +21,30 @@ from slaf.data.converter import SLAFConverter
 from slaf.integrations import ensure_h5ad_writable
 
 
+def _write_pairwise_h5ad(path, *, prefix: str, values: np.ndarray) -> sc.AnnData:
+    """Write a small H5AD with stable obsm and obsp schemas."""
+    n_cells, n_genes = values.shape
+    adata = sc.AnnData(
+        X=sparse.csr_matrix(values),
+        obs=pd.DataFrame(
+            {"cell_type": ["type_a"] * n_cells},
+            index=[f"{prefix}_{index}" for index in range(n_cells)],
+        ),
+        var=pd.DataFrame(index=[f"gene_{index}" for index in range(n_genes)]),
+    )
+    adata.obsm["embedding"] = np.column_stack(
+        [np.arange(n_cells), np.arange(n_cells) + 0.5]
+    ).astype(np.float32)
+    graph = sparse.lil_matrix((n_cells, n_cells), dtype=np.float32)
+    for index in range(n_cells - 1):
+        graph[index, index + 1] = 1.0
+        graph[index + 1, index] = 1.0
+    adata.obsp["connectivities"] = graph.tocsr()
+    ensure_h5ad_writable(adata)
+    adata.write_h5ad(path)
+    return adata
+
+
 class TestAppendFunctionality:
     """Test the append functionality for existing SLAF datasets."""
 
@@ -346,8 +370,8 @@ class TestAppendFunctionality:
         with pytest.raises(ValueError, match="Validation failed"):
             converter.append(str(incompatible_file), str(initial_slaf_path))
 
-    def test_append_nonexistent_dataset(self, synthetic_data_dir, tmp_path):
-        """Test that append fails gracefully with nonexistent dataset."""
+    def test_append_creates_nonexistent_dataset(self, synthetic_data_dir, tmp_path):
+        """The first append initializes the destination and records its source."""
         converter = SLAFConverter(
             chunked=True,
             chunk_size=25,
@@ -359,8 +383,158 @@ class TestAppendFunctionality:
         first_file = synthetic_data_dir["compatible_files"][0]
         nonexistent_slaf = os.path.join(tmp_path, "nonexistent.slaf")
 
-        with pytest.raises(FileNotFoundError, match="Existing SLAF dataset not found"):
-            converter.append(str(first_file), str(nonexistent_slaf))
+        converter.append(str(first_file), str(nonexistent_slaf))
+
+        cells = lance.dataset(os.path.join(nonexistent_slaf, "cells.lance"))
+        assert cells.count_rows() == 50
+        assert set(
+            cells.to_table(columns=["source_file"])["source_file"].to_pylist()
+        ) == {os.path.basename(first_file)}
+        with open(os.path.join(nonexistent_slaf, "config.json")) as config_file:
+            config = json.load(config_file)
+        assert config["multi_file"] == {
+            "source_files": [
+                {
+                    "file_path": first_file,
+                    "file_name": os.path.basename(first_file),
+                    "n_cells": 50,
+                    "cell_offset": 0,
+                }
+            ],
+            "total_files": 1,
+            "total_cells_from_files": 50,
+        }
+
+    def test_append_create_then_append_uses_uniform_workflow(
+        self, synthetic_data_dir, tmp_path
+    ):
+        """Repeated append calls initialize once and then append normally."""
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=25,
+            create_indices=False,
+            optimize_storage=True,
+            use_optimized_dtypes=True,
+        )
+        output_path = tmp_path / "streamed.slaf"
+        first_file, second_file = synthetic_data_dir["compatible_files"][:2]
+
+        converter.append(first_file, str(output_path))
+        converter.append(second_file, str(output_path))
+
+        cells = lance.dataset(output_path / "cells.lance")
+        assert cells.count_rows() == 100
+        assert set(
+            cells.to_table(columns=["source_file"])["source_file"].to_pylist()
+        ) == {
+            os.path.basename(first_file),
+            os.path.basename(second_file),
+        }
+        with open(output_path / "config.json") as config_file:
+            config = json.load(config_file)
+        assert [
+            source["file_name"] for source in config["multi_file"]["source_files"]
+        ] == [os.path.basename(first_file), os.path.basename(second_file)]
+        manifest = converter.get_source_manifest(str(output_path))
+        assert [source["file_name"] for source in manifest] == [
+            os.path.basename(first_file),
+            os.path.basename(second_file),
+        ]
+        assert (
+            converter.get_gene_order(str(output_path))
+            == sc.read_h5ad(first_file).var_names.tolist()
+        )
+
+    def test_append_sanitizes_metadata_columns_before_schema_validation(self, tmp_path):
+        """Append compares incoming metadata using Lance-compatible names."""
+        input_paths = []
+        for file_index in range(2):
+            input_path = tmp_path / f"input_{file_index}.h5ad"
+            observations = pd.DataFrame(
+                {
+                    "orig.ident": [f"sample_{file_index}"] * 2,
+                    "nCount_Spatial.1": [file_index + 1, file_index + 2],
+                },
+                index=[f"cell_{file_index}_{index}" for index in range(2)],
+            )
+            adata = sc.AnnData(
+                X=sparse.csr_matrix(np.eye(2, dtype=np.float32)),
+                obs=observations,
+                var=pd.DataFrame(index=["gene_0", "gene_1"]),
+            )
+            adata.write_h5ad(input_path)
+            input_paths.append(input_path)
+
+        output_path = tmp_path / "dotted_columns.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+
+        converter.append(str(input_paths[0]), str(output_path))
+        converter.append(str(input_paths[1]), str(output_path))
+
+        cells = lance.dataset(output_path / "cells.lance").to_table()
+        assert cells.num_rows == 4
+        assert "orig_ident" in cells.column_names
+        assert "nCount_Spatial_1" in cells.column_names
+        assert cells["orig_ident"].to_pylist() == [
+            "sample_0",
+            "sample_0",
+            "sample_1",
+            "sample_1",
+        ]
+        assert cells["nCount_Spatial_1"].to_pylist() == [1, 2, 2, 3]
+
+    def test_conversion_rejects_metadata_sanitization_collisions(self, tmp_path):
+        """Distinct source columns cannot map to one Lance field name."""
+        input_path = tmp_path / "colliding_columns.h5ad"
+        adata = sc.AnnData(
+            X=sparse.csr_matrix([[1.0]]),
+            obs=pd.DataFrame(
+                {"source.name": ["first"], "source_name": ["second"]},
+                index=["cell_0"],
+            ),
+            var=pd.DataFrame(index=["gene_0"]),
+        )
+        adata.write_h5ad(input_path)
+
+        with pytest.raises(ValueError, match="collide after replacing"):
+            SLAFConverter().append(
+                str(input_path),
+                str(tmp_path / "colliding_columns.slaf"),
+            )
+
+    def test_append_rejects_directory_initialization(
+        self, synthetic_data_dir, tmp_path
+    ):
+        """A missing destination cannot be initialized from a directory."""
+        converter = SLAFConverter()
+        output_path = tmp_path / "directory.slaf"
+
+        with pytest.raises(ValueError, match="Cannot initialize.*directory"):
+            converter.append(synthetic_data_dir["compatible_dir"], str(output_path))
+
+        assert not output_path.exists()
+
+    def test_append_rejects_incomplete_existing_destination(
+        self, synthetic_data_dir, tmp_path
+    ):
+        """An existing partial directory is not treated as a new SLAF."""
+        converter = SLAFConverter()
+        output_path = tmp_path / "incomplete.slaf"
+        output_path.mkdir()
+
+        with pytest.raises(ValueError, match="Existing SLAF dataset is incomplete"):
+            converter.append(
+                synthetic_data_dir["compatible_files"][0],
+                str(output_path),
+            )
+
+        assert list(output_path.iterdir()) == []
 
     def test_append_empty_directory(self, synthetic_data_dir, tmp_path):
         """Test that append fails gracefully with empty directory."""
@@ -657,3 +831,322 @@ class TestAppendFunctionality:
         )
         final_cell_count = len(final_cells_dataset.to_table())
         assert final_cell_count == 100
+
+    def test_append_preserves_obsm_obsp_and_statistics(self, tmp_path):
+        """Chunked initialization and append preserve obsm, obsp, and metadata."""
+        first_path = tmp_path / "first.h5ad"
+        second_path = tmp_path / "second.h5ad"
+        first = _write_pairwise_h5ad(
+            first_path,
+            prefix="first",
+            values=np.array([[1, 0, 2], [0, 3, 0]], dtype=np.float32),
+        )
+        second = _write_pairwise_h5ad(
+            second_path,
+            prefix="second",
+            values=np.array([[4, 0, 5], [0, 6, 0], [7, 0, 8]], dtype=np.float32),
+        )
+        output_path = tmp_path / "pairwise.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+
+        converter.append(str(first_path), str(output_path))
+        converter.append(str(second_path), str(output_path))
+
+        from slaf.core.slaf import SLAFArray
+        from slaf.integrations.anndata import LazyAnnData
+
+        lazy = LazyAnnData(SLAFArray(output_path, load_metadata=False))
+        np.testing.assert_allclose(
+            lazy.obsm["embedding"],
+            np.vstack([first.obsm["embedding"], second.obsm["embedding"]]),
+        )
+        expected_graph = sparse.block_diag(
+            [
+                first.obsp["connectivities"],
+                second.obsp["connectivities"],
+            ],
+            format="csr",
+        )
+        np.testing.assert_allclose(
+            lazy.obsp["connectivities"].toarray(),
+            expected_graph.toarray(),
+        )
+
+        with open(output_path / "config.json") as config_file:
+            config = json.load(config_file)
+        all_nonzero = np.concatenate([first.X.data, second.X.data]).astype(np.float64)
+        assert config["n_cells"] == 5
+        assert config["obsm"]["dimensions"]["embedding"] == 2
+        assert config["obsp"]["dimensions"]["connectivities"] == 5
+        assert config["metadata"]["expression_count"] == len(all_nonzero)
+        assert config["metadata"]["expression_stats"]["mean_value"] == pytest.approx(
+            all_nonzero.mean()
+        )
+        assert config["metadata"]["expression_stats"]["std_value"] == pytest.approx(
+            all_nonzero.std(ddof=1)
+        )
+
+    def test_append_rejects_reordered_genes_before_writing(self, tmp_path):
+        """Matching gene sets with a different token order are incompatible."""
+        first_path = tmp_path / "first.h5ad"
+        reordered_path = tmp_path / "reordered.h5ad"
+        first = _write_pairwise_h5ad(
+            first_path,
+            prefix="first",
+            values=np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
+        )
+        reordered = first[:, ::-1].copy()
+        reordered.obs_names = ["reordered_0", "reordered_1"]
+        reordered.write_h5ad(reordered_path)
+        output_path = tmp_path / "ordered.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(first_path), str(output_path))
+        initial_cells = lance.dataset(output_path / "cells.lance").count_rows()
+        initial_expression = lance.dataset(
+            output_path / "expression.lance"
+        ).count_rows()
+
+        with pytest.raises(ValueError, match="Gene order differs"):
+            converter.append(str(reordered_path), str(output_path))
+
+        assert lance.dataset(output_path / "cells.lance").count_rows() == initial_cells
+        assert (
+            lance.dataset(output_path / "expression.lance").count_rows()
+            == initial_expression
+        )
+
+    @pytest.mark.parametrize("mismatch", ["missing_obsm", "obsm_width", "missing_obsp"])
+    def test_append_rejects_obsm_obsp_schema_mismatch(self, tmp_path, mismatch):
+        """Append requires the established obsm and obsp contract."""
+        first_path = tmp_path / "first.h5ad"
+        mismatch_path = tmp_path / f"{mismatch}.h5ad"
+        first = _write_pairwise_h5ad(
+            first_path,
+            prefix="first",
+            values=np.array([[1, 0, 2], [0, 3, 0]], dtype=np.float32),
+        )
+        candidate = first.copy()
+        candidate.obs_names = [f"candidate_{index}" for index in range(candidate.n_obs)]
+        if mismatch == "missing_obsm":
+            del candidate.obsm["embedding"]
+        elif mismatch == "obsm_width":
+            candidate.obsm["embedding"] = np.ones(
+                (candidate.n_obs, 3), dtype=np.float32
+            )
+        else:
+            del candidate.obsp["connectivities"]
+        candidate.write_h5ad(mismatch_path)
+        output_path = tmp_path / "pairwise.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(first_path), str(output_path))
+
+        with pytest.raises(ValueError, match="obsm|obsp"):
+            converter.append(str(mismatch_path), str(output_path))
+
+        assert lance.dataset(output_path / "cells.lance").count_rows() == first.n_obs
+
+    def test_append_stops_after_first_processing_failure(
+        self, synthetic_data_dir, tmp_path, monkeypatch
+    ):
+        """A runtime failure prevents append from attempting later files."""
+        output_path = tmp_path / "fail_fast.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=25,
+            create_indices=False,
+            compact_after_write=False,
+        )
+        converter.convert(synthetic_data_dir["compatible_files"][0], str(output_path))
+        attempts = 0
+
+        def fail_processing(*args, **kwargs):
+            nonlocal attempts
+            del args, kwargs
+            attempts += 1
+            raise RuntimeError("injected append failure")
+
+        monkeypatch.setattr(
+            converter,
+            "_process_file_chunks_with_checkpoint",
+            fail_processing,
+        )
+
+        with pytest.raises(RuntimeError, match="injected append failure"):
+            converter.append(
+                synthetic_data_dir["compatible_dir"],
+                str(output_path),
+            )
+
+        assert attempts == 1
+
+    def test_finalize_validates_counts_and_creates_indices(self, tmp_path):
+        """Finalization creates indexes once streaming appends are complete."""
+        input_path = tmp_path / "input.h5ad"
+        _write_pairwise_h5ad(
+            input_path,
+            prefix="cell",
+            values=np.array([[1, 0, 2], [0, 3, 0]], dtype=np.float32),
+        )
+        output_path = tmp_path / "finalized.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(input_path), str(output_path))
+
+        converter.finalize(str(output_path), create_indices=True)
+
+        indexed_fields = {
+            field
+            for index in lance.dataset(
+                output_path / "cellsxcells.lance"
+            ).describe_indices()
+            for field in index.field_names
+        }
+        assert "cell_integer_id_i" in indexed_fields
+
+    def test_finalize_can_skip_expression_indices(self, tmp_path):
+        """Finalization can omit expression indices without omitting graph indices."""
+        input_path = tmp_path / "input.h5ad"
+        _write_pairwise_h5ad(
+            input_path,
+            prefix="cell",
+            values=np.array([[1, 0, 2], [0, 3, 0]], dtype=np.float32),
+        )
+        output_path = tmp_path / "finalized.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=2,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(input_path), str(output_path))
+
+        converter.finalize(
+            str(output_path),
+            create_indices=True,
+            create_expression_indices=False,
+        )
+        converter.finalize(
+            str(output_path),
+            create_indices=True,
+            create_expression_indices=False,
+        )
+
+        expression_fields = {
+            field
+            for index in lance.dataset(
+                output_path / "expression.lance"
+            ).describe_indices()
+            for field in index.field_names
+        }
+        graph_fields = {
+            field
+            for index in lance.dataset(
+                output_path / "cellsxcells.lance"
+            ).describe_indices()
+            for field in index.field_names
+        }
+        assert expression_fields == set()
+        assert "cell_integer_id_i" in graph_fields
+
+    def test_finalize_compacts_expression_without_changing_rows(self, tmp_path):
+        """Finalization merges small expression fragments and preserves order."""
+        input_path = tmp_path / "input.h5ad"
+        _write_pairwise_h5ad(
+            input_path,
+            prefix="cell",
+            values=np.array(
+                [
+                    [1, 0, 2],
+                    [0, 3, 0],
+                    [4, 0, 5],
+                    [0, 6, 0],
+                ],
+                dtype=np.float32,
+            ),
+        )
+        output_path = tmp_path / "compacted.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=1,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(input_path), str(output_path))
+        expression_path = output_path / "expression.lance"
+        before = lance.dataset(expression_path)
+        before_fragments = len(list(before.get_fragments()))
+        before_table = before.to_table()
+
+        converter.finalize(
+            str(output_path),
+            create_indices=False,
+            compact=True,
+            expression_target_rows_per_fragment=100,
+        )
+
+        after = lance.dataset(expression_path)
+        assert len(list(after.get_fragments())) < before_fragments
+        assert len(after.versions()) == 1
+        assert len(lance.dataset(output_path / "cells.lance").versions()) == 1
+        assert len(lance.dataset(output_path / "genes.lance").versions()) == 1
+        assert after.to_table().equals(before_table)
+
+    def test_compact_expression_discards_obsolete_versions(self, tmp_path):
+        """Incremental expression compaction retains exact rows and one version."""
+        input_path = tmp_path / "input.h5ad"
+        _write_pairwise_h5ad(
+            input_path,
+            prefix="cell",
+            values=np.array(
+                [[1, 0, 2], [0, 3, 0], [4, 0, 5], [0, 6, 0]],
+                dtype=np.float32,
+            ),
+        )
+        output_path = tmp_path / "compacted.slaf"
+        converter = SLAFConverter(
+            chunked=True,
+            chunk_size=1,
+            create_indices=False,
+            compact_after_write=False,
+            use_optimized_dtypes=False,
+        )
+        converter.convert(str(input_path), str(output_path))
+        expression_path = output_path / "expression.lance"
+        before = lance.dataset(expression_path)
+        before_table = before.to_table()
+        before_fragments = len(list(before.get_fragments()))
+
+        converter.compact_expression(
+            str(output_path),
+            target_rows_per_fragment=100,
+        )
+
+        after = lance.dataset(expression_path)
+        assert len(list(after.get_fragments())) < before_fragments
+        assert len(after.versions()) == 1
+        assert after.to_table().equals(before_table)
