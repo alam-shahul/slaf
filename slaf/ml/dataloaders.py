@@ -635,6 +635,11 @@ class SLAFDataLoader:
         """
         return 0  # Indicates unknown length
 
+    def close(self) -> None:
+        """Stop prefetching and release dataset resources."""
+        if hasattr(self, "_dataset"):
+            self._dataset.close()
+
     def __del__(self):
         """
         Cleanup method to stop async prefetching.
@@ -660,7 +665,4 @@ class SLAFDataLoader:
             >>> print("Manual cleanup completed")
             Manual cleanup completed
         """
-        if hasattr(self, "_dataset"):
-            # The SLAFIterableDataset doesn't have a stop method,
-            # so we just let it finish its current epoch.
-            pass
+        self.close()

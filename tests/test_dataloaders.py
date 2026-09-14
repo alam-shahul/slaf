@@ -831,7 +831,7 @@ class TestSLAFDataLoader:
         assert batch_count > 0
 
     def test_mixture_of_scanners_fragment_generators_creation(self, tiny_slaf):
-        """Test that MoS creates fragment generators correctly"""
+        """Test that MoS keeps a bounded fragment-generator pool."""
         dataloader = build_dataloader(
             tiny_slaf,
             batch_size=32,
@@ -840,19 +840,9 @@ class TestSLAFDataLoader:
             prefetch_batch_size=1048576,
         )
 
-        # Check that fragment generators are created in the underlying dataset
-        assert hasattr(dataloader._dataset.batch_processor, "fragment_generators")
-        assert len(dataloader._dataset.batch_processor.fragment_generators) > 0
-
-        # Check that generator tracking arrays are created
-        assert hasattr(dataloader._dataset.batch_processor, "generator_last_cells")
-        assert hasattr(dataloader._dataset.batch_processor, "generator_active")
-        assert len(dataloader._dataset.batch_processor.generator_last_cells) == len(
-            dataloader._dataset.batch_processor.fragment_generators
-        )
-        assert len(dataloader._dataset.batch_processor.generator_active) == len(
-            dataloader._dataset.batch_processor.fragment_generators
-        )
+        processor = dataloader._dataset.batch_processor
+        assert len(processor.fragment_generators) <= processor.n_scanners
+        assert set(processor.generator_last_cells) == set(processor.fragment_generators)
 
     def test_mixture_of_scanners_random_sampling_behavior(self, tiny_slaf):
         """Test that MoS uses random sampling from fragment generators"""

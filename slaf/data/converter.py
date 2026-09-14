@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import time
+from collections.abc import Iterable
 from typing import Any
 
 import lance
@@ -8,6 +10,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
+from lance.optimize import Compaction, CompactionOptions
 from loguru import logger
 from scipy import sparse
 
@@ -31,6 +34,37 @@ except ImportError:
 
 from .chunked_reader import create_chunked_reader
 from .utils import discover_input_files, validate_input_files
+
+
+def _sanitize_metadata_column_names(column_names: Iterable[Any]) -> list[str]:
+    """Return Lance-compatible metadata names and reject collisions.
+
+    Args:
+        column_names: Source metadata column names.
+
+    Returns:
+        Column names with periods replaced by underscores.
+
+    Raises:
+        ValueError: If distinct source names become identical after sanitization.
+    """
+    original_names = [str(name) for name in column_names]
+    sanitized_names = [name.replace(".", "_") for name in original_names]
+    sources_by_name: dict[str, list[str]] = {}
+    for original_name, sanitized_name in zip(
+        original_names, sanitized_names, strict=False
+    ):
+        sources_by_name.setdefault(sanitized_name, []).append(original_name)
+    collisions = {
+        name: sorted(source_names)
+        for name, source_names in sources_by_name.items()
+        if len(source_names) > 1
+    }
+    if collisions:
+        raise ValueError(
+            f"Metadata column names collide after replacing '.' with '_': {collisions}."
+        )
+    return sanitized_names
 
 
 def _check_output_filesystem(output_path: str) -> None:
@@ -1024,30 +1058,54 @@ class SLAFConverter:
 
     def append(
         self, input_path: str, existing_slaf_path: str, input_format: str = "auto"
-    ):
+    ) -> None:
         """
-        Append new data to an existing SLAF dataset.
+        Create or append to a SLAF dataset.
 
-        This method adds new data to an existing SLAF dataset by:
-        1. Validating compatibility with existing dataset
-        2. Reading existing dataset metadata
-        3. Appending new data with auto-incrementing IDs
-        4. Updating configuration with new source file info
+        A missing destination is initialized from one input file. Existing
+        destinations are validated before new cells are appended with globally
+        offset integer IDs.
 
         Args:
-            input_path: Path to new input file or directory
-            existing_slaf_path: Path to existing SLAF dataset
-            input_format: Format of input data (auto-detected if not specified)
+            input_path: Input file, or a directory when appending to an existing SLAF.
+            existing_slaf_path: Destination SLAF dataset path.
+            input_format: Input format, auto-detected by default.
+
+        Raises:
+            ValueError: If initialization receives a directory or an existing
+                destination is incomplete or incompatible.
         """
+        if not self._path_exists(existing_slaf_path):
+            if os.path.isdir(input_path):
+                raise ValueError(
+                    "Cannot initialize a SLAF with append() from a directory. "
+                    "Pass one input file, or use convert() for multi-file conversion."
+                )
+            logger.info(f"Creating SLAF dataset {existing_slaf_path} from {input_path}")
+            self.convert(input_path, existing_slaf_path, input_format=input_format)
+            self._record_initial_append_source(existing_slaf_path, input_path)
+            return
+
+        required_paths = [
+            "config.json",
+            "cells.lance",
+            "genes.lance",
+            "expression.lance",
+        ]
+        missing_paths = [
+            name
+            for name in required_paths
+            if not self._path_exists(os.path.join(existing_slaf_path, name))
+        ]
+        if missing_paths:
+            raise ValueError(
+                f"Existing SLAF dataset is incomplete: {existing_slaf_path}. "
+                f"Missing: {missing_paths}."
+            )
+
         logger.info(
             f"Appending data from {input_path} to existing SLAF dataset {existing_slaf_path}"
         )
-
-        # Check if existing SLAF dataset exists
-        if not self._path_exists(existing_slaf_path):
-            raise FileNotFoundError(
-                f"Existing SLAF dataset not found: {existing_slaf_path}"
-            )
 
         # Discover input files
         input_files, detected_format = discover_input_files(input_path)
@@ -1069,11 +1127,21 @@ class SLAFConverter:
         )
 
         # Read existing dataset metadata
-        existing_cells_dataset = lance.dataset(
-            os.path.join(existing_slaf_path, "cells.lance")
-        )
-        existing_cells_table = existing_cells_dataset.to_table()
-        current_cell_count = len(existing_cells_table)
+        cells_path = os.path.join(existing_slaf_path, "cells.lance")
+        existing_cells_dataset = lance.dataset(cells_path)
+        current_cell_count = existing_cells_dataset.count_rows()
+        if "source_file" not in existing_cells_dataset.schema.names:
+            logger.info("Adding source_file column to existing dataset...")
+            existing_cells_dataset.add_columns({"source_file": "'original_data'"})
+            existing_cells_dataset = lance.dataset(cells_path)
+
+        existing_config = self._load_existing_config(existing_slaf_path)
+        obsm_config = existing_config.get("obsm", {})
+        obsm_keys = list(obsm_config.get("available", []))
+        obsm_dimensions = {
+            key: int(value) for key, value in obsm_config.get("dimensions", {}).items()
+        }
+        obsp_keys = list(existing_config.get("obsp", {}).get("available", []))
         existing_expression_dataset = lance.dataset(
             os.path.join(existing_slaf_path, "expression.lance")
         )
@@ -1122,37 +1190,6 @@ class SLAFConverter:
                     source_file = os.path.basename(file_path)
                     obs_df["source_file"] = source_file
 
-                    # Check if existing dataset has source_file column
-                    existing_cells_dataset = lance.dataset(
-                        os.path.join(existing_slaf_path, "cells.lance")
-                    )
-                    existing_cells_table = existing_cells_dataset.to_table()
-                    existing_columns = set(existing_cells_table.column_names)
-
-                    # If existing dataset doesn't have source_file column, add it to existing data
-                    if "source_file" not in existing_columns:
-                        logger.info("Adding source_file column to existing dataset...")
-                        # Read existing cells data
-                        existing_cells_df = existing_cells_table.to_pandas()
-                        existing_cells_df["source_file"] = (
-                            "original_data"  # Default source for existing data
-                        )
-
-                        # Recreate the cells dataset with source_file column
-                        updated_cells_table = pa.table(existing_cells_df)
-                        # Cast large_string to string so subsequent appends match schema
-                        updated_cells_table = self._cast_table_string_columns_to_utf8(
-                            updated_cells_table, ["cell_id"]
-                        )
-                        lance.write_dataset(
-                            updated_cells_table,
-                            os.path.join(existing_slaf_path, "cells.lance"),
-                            mode="overwrite",
-                            enable_v2_manifest_paths=self.enable_v2_manifest,
-                            data_storage_version="2.2",
-                        )
-                        logger.info("✓ Added source_file column to existing dataset")
-
                     # Precompute cell start indices
                     obs_df["cell_start_index"] = (
                         np.asarray(
@@ -1166,9 +1203,19 @@ class SLAFConverter:
                     cell_metadata_table = self._create_metadata_table(
                         obs_df, "cell_id", integer_mapping=None
                     )
+                    cell_metadata_table = self._add_obsm_columns(
+                        cell_metadata_table,
+                        reader.adata.obsm if reader.adata is not None else {},
+                        obsm_keys,
+                        obsm_dimensions,
+                        len(obs_df),
+                    )
+                    existing_cells_dataset = lance.dataset(cells_path)
+                    cell_metadata_table = cell_metadata_table.select(
+                        existing_cells_dataset.schema.names
+                    ).cast(existing_cells_dataset.schema)
 
                     # Append to existing cells dataset
-                    cells_path = os.path.join(existing_slaf_path, "cells.lance")
                     lance.write_dataset(
                         cell_metadata_table,
                         cells_path,
@@ -1180,7 +1227,7 @@ class SLAFConverter:
                     # Process expression data in chunks with checkpointing support
                     # Use the same checkpointing infrastructure as convert method
                     # Pass existing expression schema so chunks are cast before append
-                    self._process_file_chunks_with_checkpoint(
+                    expression_aggregates = self._process_file_chunks_with_checkpoint(
                         reader,
                         existing_slaf_path,
                         i,
@@ -1189,14 +1236,30 @@ class SLAFConverter:
                         append_schema=existing_expr_schema,
                     )
 
+                    if obsp_keys:
+                        self._append_multi_file_obsp(
+                            file_path=file_path,
+                            output_path=existing_slaf_path,
+                            obsp_keys=obsp_keys,
+                            cell_offset=global_cell_offset,
+                            n_cells=len(obs_df),
+                            initialize_table=False,
+                        )
+
                     # Track source file information
-                    source_file_info.append(
-                        {
-                            "file_path": file_path,
-                            "file_name": source_file,
-                            "n_cells": len(obs_df),
-                            "cell_offset": global_cell_offset,
-                        }
+                    file_info = {
+                        "file_path": file_path,
+                        "file_name": source_file,
+                        "n_cells": len(obs_df),
+                        "cell_offset": global_cell_offset,
+                    }
+                    source_file_info.append(file_info)
+
+                    self._update_config_with_append(
+                        existing_slaf_path,
+                        [file_info],
+                        len(obs_df),
+                        expression_aggregates,
                     )
 
                     # Update global offsets
@@ -1232,16 +1295,10 @@ class SLAFConverter:
                         "timestamp": pd.Timestamp.now().isoformat(),
                     }
                     self._save_checkpoint(existing_slaf_path, checkpoint_data)
-                # Continue with other files
-                continue
+                raise
 
         if not source_file_info:
             raise RuntimeError("No files were successfully processed")
-
-        # Update configuration with new source file information
-        self._update_config_with_append(
-            existing_slaf_path, source_file_info, total_new_cells
-        )
 
         # Clear checkpoint after successful completion
         self._clear_checkpoint(existing_slaf_path)
@@ -1251,6 +1308,39 @@ class SLAFConverter:
         )
         logger.info(f"Total cells in dataset: {current_cell_count + total_new_cells}")
 
+    def _record_initial_append_source(
+        self,
+        existing_slaf_path: str,
+        input_path: str,
+    ) -> None:
+        """Record provenance for a SLAF initialized through append()."""
+        source_file = os.path.basename(input_path)
+        escaped_source_file = source_file.replace("'", "''")
+        source_literal = f"'{escaped_source_file}'"
+        cells_dataset = lance.dataset(f"{existing_slaf_path}/cells.lance")
+        if "source_file" in cells_dataset.schema.names:
+            cells_dataset.update({"source_file": source_literal})
+        else:
+            cells_dataset.add_columns({"source_file": source_literal})
+
+        n_cells = cells_dataset.count_rows()
+        config = self._load_existing_config(existing_slaf_path)
+        config["multi_file"] = {
+            "source_files": [
+                {
+                    "file_path": input_path,
+                    "file_name": source_file,
+                    "n_cells": n_cells,
+                    "cell_offset": 0,
+                }
+            ],
+            "total_files": 1,
+            "total_cells_from_files": n_cells,
+        }
+        config["last_updated"] = pd.Timestamp.now().isoformat()
+        with self._open_file(f"{existing_slaf_path}/config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
     def _validate_append_compatibility(
         self, input_files: list[str], input_format: str, existing_slaf_path: str
     ):
@@ -1259,55 +1349,42 @@ class SLAFConverter:
 
         # Load existing dataset metadata
         existing_cells_dataset = lance.dataset(f"{existing_slaf_path}/cells.lance")
-        existing_cells_table = existing_cells_dataset.to_table()
         existing_genes_dataset = lance.dataset(f"{existing_slaf_path}/genes.lance")
-        existing_genes_table = existing_genes_dataset.to_table()
+        existing_genes_table = existing_genes_dataset.to_table(
+            columns=["gene_id", "gene_integer_id"]
+        ).sort_by("gene_integer_id")
+        existing_config = self._load_existing_config(existing_slaf_path)
 
-        # Get existing gene set and cell metadata schema
-        existing_genes = set(existing_genes_table.column("gene_id").to_numpy())
-        existing_cell_columns = set(existing_cells_table.column_names)
+        existing_gene_order = [
+            str(gene_id)
+            for gene_id in existing_genes_table.column("gene_id").to_pylist()
+        ]
+        existing_cell_columns = set(existing_cells_dataset.schema.names)
+        expected_obsm = {
+            key: int(value)
+            for key, value in existing_config.get("obsm", {})
+            .get("dimensions", {})
+            .items()
+        }
+        expected_obsp = set(existing_config.get("obsp", {}).get("available", []))
 
-        # Validate new files against existing dataset
         for file_path in input_files:
             try:
-                # Extract schema from new file
-                genes, cells, value_type = self._extract_schema_info(
-                    file_path, input_format
-                )
-
-                # Check gene compatibility
-                if genes != existing_genes:
-                    missing_genes = existing_genes - genes
-                    extra_genes = genes - existing_genes
-                    error_msg = f"File {os.path.basename(file_path)} is incompatible with existing dataset:"
-                    if missing_genes:
-                        error_msg += f"\n  Missing genes: {sorted(missing_genes)[:5]}{'...' if len(missing_genes) > 5 else ''}"
-                    if extra_genes:
-                        error_msg += f"\n  Extra genes: {sorted(extra_genes)[:5]}{'...' if len(extra_genes) > 5 else ''}"
-                    raise ValueError(error_msg)
-
-                # Check cell metadata schema compatibility
-                # Exclude columns that are added during SLAF conversion
-                slaF_added_columns = {
-                    "cell_id",
-                    "cell_integer_id",
-                    "cell_start_index",
-                    "source_file",
-                }
-                new_cell_columns = cells - slaF_added_columns
-                existing_cell_columns_no_slaf = (
-                    existing_cell_columns - slaF_added_columns
-                )
-
-                if new_cell_columns != existing_cell_columns_no_slaf:
-                    missing_cols = existing_cell_columns_no_slaf - new_cell_columns
-                    extra_cols = new_cell_columns - existing_cell_columns_no_slaf
-                    error_msg = f"File {os.path.basename(file_path)} has incompatible cell metadata schema:"
-                    if missing_cols:
-                        error_msg += f"\n  Missing columns: {sorted(missing_cols)}"
-                    if extra_cols:
-                        error_msg += f"\n  Extra columns: {sorted(extra_cols)}"
-                    raise ValueError(error_msg)
+                if input_format == "h5ad":
+                    self._validate_h5ad_append_file(
+                        file_path,
+                        existing_gene_order,
+                        existing_cell_columns,
+                        expected_obsm,
+                        expected_obsp,
+                    )
+                else:
+                    self._validate_generic_append_file(
+                        file_path,
+                        input_format,
+                        set(existing_gene_order),
+                        existing_cell_columns,
+                    )
 
             except Exception as e:
                 raise ValueError(
@@ -1315,6 +1392,114 @@ class SLAFConverter:
                 ) from e
 
         logger.info("✓ All files are compatible with existing dataset")
+
+    def _validate_h5ad_append_file(
+        self,
+        file_path: str,
+        expected_gene_order: list[str],
+        existing_cell_columns: set[str],
+        expected_obsm: dict[str, int],
+        expected_obsp: set[str],
+    ) -> None:
+        """Validate the ordered expression, obsm, and obsp schema of one H5AD."""
+        adata = sc.read_h5ad(file_path, backed="r")
+        try:
+            gene_order = [str(gene_id) for gene_id in adata.var_names]
+            if gene_order != expected_gene_order:
+                expected_genes = set(expected_gene_order)
+                actual_genes = set(gene_order)
+                if actual_genes == expected_genes:
+                    raise ValueError(
+                        "Gene order differs from the existing SLAF vocabulary."
+                    )
+                raise ValueError(
+                    "Gene vocabulary differs from the existing SLAF "
+                    f"(missing={sorted(expected_genes - actual_genes)[:5]}, "
+                    f"extra={sorted(actual_genes - expected_genes)[:5]})."
+                )
+
+            obsm_keys, obsm_dimensions = self._obsm_schema(adata, adata.n_obs)
+            if set(obsm_keys) != set(expected_obsm):
+                raise ValueError(
+                    "obsm keys differ from the existing SLAF: "
+                    f"expected {sorted(expected_obsm)}, got {sorted(obsm_keys)}."
+                )
+            if obsm_dimensions != expected_obsm:
+                raise ValueError(
+                    "obsm dimensions differ from the existing SLAF: "
+                    f"expected {expected_obsm}, got {obsm_dimensions}."
+                )
+
+            obsp_keys = set(adata.obsp.keys())
+            for key in obsp_keys:
+                shape = getattr(adata.obsp[key], "shape", None)
+                if shape != (adata.n_obs, adata.n_obs):
+                    raise ValueError(
+                        f"obsp '{key}' has shape {shape}; expected "
+                        f"({adata.n_obs}, {adata.n_obs})."
+                    )
+            if obsp_keys != expected_obsp:
+                raise ValueError(
+                    "obsp keys differ from the existing SLAF: "
+                    f"expected {sorted(expected_obsp)}, got {sorted(obsp_keys)}."
+                )
+
+            self._validate_append_cell_columns(
+                file_path,
+                set(adata.obs.columns),
+                existing_cell_columns,
+                set(expected_obsm),
+            )
+        finally:
+            adata.file.close()
+
+    def _validate_generic_append_file(
+        self,
+        file_path: str,
+        input_format: str,
+        expected_genes: set[str],
+        existing_cell_columns: set[str],
+    ) -> None:
+        """Validate one non-H5AD input against the expression schema."""
+        genes, cells, _value_type = self._extract_schema_info(file_path, input_format)
+        if genes != expected_genes:
+            raise ValueError(
+                f"File {os.path.basename(file_path)} has a different gene vocabulary "
+                f"(missing={sorted(expected_genes - genes)[:5]}, "
+                f"extra={sorted(genes - expected_genes)[:5]})."
+            )
+        self._validate_append_cell_columns(
+            file_path,
+            cells,
+            existing_cell_columns,
+            set(),
+        )
+
+    def _validate_append_cell_columns(
+        self,
+        file_path: str,
+        input_columns: Iterable[Any],
+        existing_columns: set[str],
+        obsm_keys: set[str],
+    ) -> None:
+        """Validate user-owned cell metadata columns."""
+        converter_columns = {
+            "cell_id",
+            "cell_integer_id",
+            "cell_start_index",
+            "source_file",
+            *obsm_keys,
+        }
+        expected_columns = existing_columns - converter_columns
+        actual_columns = (
+            set(_sanitize_metadata_column_names(input_columns)) - converter_columns
+        )
+        if actual_columns != expected_columns:
+            raise ValueError(
+                f"File {os.path.basename(file_path)} has incompatible cell metadata "
+                f"(missing={sorted(expected_columns - actual_columns)}, "
+                f"extra={sorted(actual_columns - expected_columns)})."
+            )
 
     def _get_existing_expression_schema(
         self, existing_slaf_path: str
@@ -1346,7 +1531,11 @@ class SLAFConverter:
             return json.load(f)
 
     def _update_config_with_append(
-        self, existing_slaf_path: str, source_file_info: list, total_new_cells: int
+        self,
+        existing_slaf_path: str,
+        source_file_info: list,
+        total_new_cells: int,
+        expression_aggregates: dict[str, float | int],
     ):
         """Update configuration with new source file information."""
         config_path = f"{existing_slaf_path}/config.json"
@@ -1355,6 +1544,67 @@ class SLAFConverter:
         # Update cell count
         config["n_cells"] += total_new_cells
         config["array_shape"][0] = config["n_cells"]
+
+        metadata = config["metadata"]
+        old_count = int(metadata["expression_count"])
+        new_count = int(expression_aggregates["count"])
+        combined_count = old_count + new_count
+        old_stats = metadata["expression_stats"]
+        old_mean = float(old_stats["mean_value"])
+        old_m2 = (
+            float(old_stats["std_value"]) ** 2 * (old_count - 1)
+            if old_count > 1
+            else 0.0
+        )
+        new_mean = (
+            float(expression_aggregates["sum_value"]) / new_count if new_count else 0.0
+        )
+        new_m2 = max(
+            0.0,
+            float(expression_aggregates["sum_squared"]) - new_count * new_mean**2,
+        )
+        if old_count and new_count:
+            delta = new_mean - old_mean
+            combined_mean = (
+                old_count * old_mean + new_count * new_mean
+            ) / combined_count
+            combined_m2 = (
+                old_m2 + new_m2 + delta**2 * old_count * new_count / combined_count
+            )
+        elif new_count:
+            combined_mean = new_mean
+            combined_m2 = new_m2
+        else:
+            combined_mean = old_mean
+            combined_m2 = old_m2
+
+        if new_count:
+            old_stats["min_value"] = min(
+                float(old_stats["min_value"]),
+                float(expression_aggregates["min_value"]),
+            )
+            old_stats["max_value"] = max(
+                float(old_stats["max_value"]),
+                float(expression_aggregates["max_value"]),
+            )
+        old_stats["mean_value"] = float(combined_mean)
+        old_stats["std_value"] = (
+            float((combined_m2 / (combined_count - 1)) ** 0.5)
+            if combined_count > 1
+            else 0.0
+        )
+        total_possible_elements = config["n_cells"] * config["n_genes"]
+        metadata["expression_count"] = combined_count
+        metadata["total_possible_elements"] = total_possible_elements
+        metadata["density"] = (
+            combined_count / total_possible_elements if total_possible_elements else 0.0
+        )
+        metadata["sparsity"] = 1.0 - metadata["density"]
+
+        if "obsp" in config:
+            config["tables"]["cellsxcells"] = "cellsxcells.lance"
+            for key in config["obsp"].get("available", []):
+                config["obsp"].setdefault("dimensions", {})[key] = config["n_cells"]
 
         # Update multi_file information
         if "multi_file" not in config:
@@ -1382,6 +1632,157 @@ class SLAFConverter:
             f"Updated configuration with {len(source_file_info)} new source files"
         )
 
+    def finalize(
+        self,
+        existing_slaf_path: str,
+        *,
+        create_indices: bool = True,
+        create_expression_indices: bool = True,
+        compact: bool = False,
+        expression_target_rows_per_fragment: int = 25_000_000,
+        compaction_mode: str = "try_binary_copy",
+    ) -> None:
+        """Finalize a SLAF dataset after incremental append operations.
+
+        Args:
+            existing_slaf_path: Existing SLAF dataset path.
+            create_indices: Create query indices after all appends complete.
+            create_expression_indices: Include expression-table scalar indices
+                when creating query indices.
+            compact: Compact Lance fragments before creating indices.
+            expression_target_rows_per_fragment: Target expression rows per
+                fragment when compacting.
+            compaction_mode: Lance compaction mode. ``try_binary_copy`` avoids
+                re-encoding compatible fragments and falls back otherwise.
+
+        Raises:
+            FileNotFoundError: If the SLAF dataset does not exist.
+            ValueError: If stored table counts disagree with the configuration.
+        """
+        if not self._path_exists(existing_slaf_path):
+            raise FileNotFoundError(
+                f"Existing SLAF dataset not found: {existing_slaf_path}"
+            )
+
+        config = self._load_existing_config(existing_slaf_path)
+        cell_count = lance.dataset(f"{existing_slaf_path}/cells.lance").count_rows()
+        expression_count = lance.dataset(
+            f"{existing_slaf_path}/expression.lance"
+        ).count_rows()
+        if cell_count != int(config["n_cells"]):
+            raise ValueError(
+                f"cells.lance contains {cell_count} rows but config records "
+                f"{config['n_cells']}."
+            )
+        if expression_count != int(config["metadata"]["expression_count"]):
+            raise ValueError(
+                f"expression.lance contains {expression_count} rows but config records "
+                f"{config['metadata']['expression_count']}."
+            )
+
+        if compact:
+            self._compact_dataset(
+                existing_slaf_path,
+                expression_target_rows_per_fragment=(
+                    expression_target_rows_per_fragment
+                ),
+                compaction_mode=compaction_mode,
+            )
+        if create_indices:
+            self._create_indices(
+                existing_slaf_path,
+                create_expression_indices=create_expression_indices,
+            )
+        if compact:
+            for table_name in ("expression", "cells", "genes"):
+                self._cleanup_lance_table_versions(
+                    f"{existing_slaf_path}/{table_name}.lance",
+                    table_name=table_name,
+                )
+
+        config["last_updated"] = pd.Timestamp.now().isoformat()
+        with self._open_file(f"{existing_slaf_path}/config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
+    def compact_expression(
+        self,
+        existing_slaf_path: str,
+        *,
+        target_rows_per_fragment: int = 25_000_000,
+        compaction_mode: str = "try_binary_copy",
+    ) -> None:
+        """Compact expression fragments and discard superseded versions.
+
+        Args:
+            existing_slaf_path: Existing SLAF dataset path.
+            target_rows_per_fragment: Target rows in each compacted fragment.
+            compaction_mode: Native Lance compaction mode.
+
+        Raises:
+            FileNotFoundError: If the expression table does not exist.
+            ValueError: If a compaction option is invalid.
+        """
+        expression_path = f"{existing_slaf_path}/expression.lance"
+        if not self._path_exists(expression_path):
+            raise FileNotFoundError(f"Expression table not found: {expression_path}")
+        self._compact_lance_table(
+            expression_path,
+            table_name="expression",
+            target_rows_per_fragment=target_rows_per_fragment,
+            compaction_mode=compaction_mode,
+        )
+        self._cleanup_lance_table_versions(
+            expression_path,
+            table_name="expression",
+        )
+
+    def get_source_manifest(self, existing_slaf_path: str) -> list[dict[str, Any]]:
+        """Return source records for an incrementally constructed dataset.
+
+        Args:
+            existing_slaf_path: Existing SLAF dataset path.
+
+        Returns:
+            Copies of the source records in append order. Datasets that were
+            not constructed from multiple sources return an empty list.
+
+        Raises:
+            FileNotFoundError: If the SLAF dataset does not exist.
+        """
+        if not self._path_exists(existing_slaf_path):
+            raise FileNotFoundError(
+                f"Existing SLAF dataset not found: {existing_slaf_path}"
+            )
+        config = self._load_existing_config(existing_slaf_path)
+        return [
+            dict(record)
+            for record in config.get("multi_file", {}).get("source_files", [])
+        ]
+
+    def get_gene_order(self, existing_slaf_path: str) -> list[str]:
+        """Return gene identifiers in their persisted integer-ID order.
+
+        Args:
+            existing_slaf_path: Existing SLAF dataset path.
+
+        Returns:
+            Ordered gene identifiers.
+
+        Raises:
+            FileNotFoundError: If the SLAF dataset does not exist.
+        """
+        if not self._path_exists(existing_slaf_path):
+            raise FileNotFoundError(
+                f"Existing SLAF dataset not found: {existing_slaf_path}"
+            )
+        genes = lance.dataset(f"{existing_slaf_path}/genes.lance").to_table(
+            columns=["gene_id", "gene_integer_id"]
+        )
+        return [
+            str(gene_id)
+            for gene_id in genes.sort_by("gene_integer_id")["gene_id"].to_pylist()
+        ]
+
     def _extract_schema_info(
         self, file_path: str, format_type: str
     ) -> tuple[set[str], set[str], str]:
@@ -1403,26 +1804,23 @@ class SLAFConverter:
 
         # Read in backed mode for efficiency
         adata = sc.read_h5ad(file_path, backed="r")
+        try:
+            gene_ids = set(adata.var_names)
+            cell_columns = set(adata.obs.columns)
 
-        # Get gene IDs
-        gene_ids = set(adata.var_names)
-
-        # Get cell metadata columns
-        cell_columns = set(adata.obs.columns)
-
-        # Determine value type from expression data
-        if hasattr(adata.X, "data"):
-            sample_data = adata.X.data[:1000]  # Sample first 1000 values
-        else:
-            # For backed mode, try to get a sample
-            try:
-                sample_data = (
-                    adata.X[:100, :100].data
-                    if hasattr(adata.X, "data")
-                    else adata.X[:100, :100].toarray().flatten()
-                )
-            except Exception:
-                sample_data = np.array([0])  # Fallback
+            if hasattr(adata.X, "data"):
+                sample_data = adata.X.data[:1000]
+            else:
+                try:
+                    sample_data = (
+                        adata.X[:100, :100].data
+                        if hasattr(adata.X, "data")
+                        else adata.X[:100, :100].toarray().flatten()
+                    )
+                except Exception:
+                    sample_data = np.array([0])
+        finally:
+            adata.file.close()
 
         # Determine value type
         if np.issubdtype(sample_data.dtype, np.integer):
@@ -1682,8 +2080,15 @@ class SLAFConverter:
 
             # Write metadata tables efficiently (without loading everything into memory)
             # Only write metadata if not resuming from checkpoint
+            reader_adata = getattr(reader, "adata", None)
+            obsm_keys, obsm_dimensions = self._obsm_schema(reader_adata, reader.n_obs)
             if not checkpoint or checkpoint.get("status") != "in_progress":
-                self._write_metadata_efficiently(reader, output_path)
+                self._write_metadata_efficiently(
+                    reader,
+                    output_path,
+                    obsm_keys=obsm_keys,
+                    obsm_dimensions=obsm_dimensions,
+                )
 
             # Check if layers exist before processing
             layer_names = []
@@ -1755,14 +2160,23 @@ class SLAFConverter:
                 output_path,
                 (reader.n_obs, reader.n_vars),
                 layer_names=layer_names,
+                obsm_keys=obsm_keys,
                 obsp_keys=obsp_keys,
             )
             self._clear_checkpoint(output_path)
             logger.info(f"Conversion complete! Saved to {output_path}")
 
-    def _write_metadata_efficiently(self, reader, output_path: str):
+    def _write_metadata_efficiently(
+        self,
+        reader,
+        output_path: str,
+        *,
+        obsm_keys: list[str] | None = None,
+        obsm_dimensions: dict[str, int] | None = None,
+    ):
         """Write metadata tables efficiently while preserving all columns"""
         logger.info("Writing metadata tables...")
+        reader_adata = getattr(reader, "adata", None)
 
         # Get full metadata from reader (this loads all columns)
         obs_df = reader.get_obs_metadata()
@@ -1792,6 +2206,13 @@ class SLAFConverter:
             obs_df,
             "cell_id",
             integer_mapping=None,  # Already added above
+        )
+        cell_metadata_table = self._add_obsm_columns(
+            cell_metadata_table,
+            reader_adata.obsm if reader_adata is not None else {},
+            obsm_keys or [],
+            obsm_dimensions or {},
+            len(obs_df),
         )
         gene_metadata_table = self._create_metadata_table(
             var_df,
@@ -2342,7 +2763,7 @@ class SLAFConverter:
         start_chunk_idx: int,
         global_cell_offset: int,
         append_schema: pa.Schema | None = None,
-    ):
+    ) -> dict[str, float | int]:
         """Process chunks for a single file with checkpointing support.
 
         When append_schema is provided and we are appending to an existing
@@ -2364,6 +2785,13 @@ class SLAFConverter:
 
         # Create iterator for chunks
         chunk_iterator = reader.iter_chunks(chunk_size=self.chunk_size)
+        aggregates: dict[str, float | int] = {
+            "min_value": float("inf"),
+            "max_value": float("-inf"),
+            "sum_value": 0.0,
+            "sum_squared": 0.0,
+            "count": 0,
+        }
 
         # Skip chunks if resuming from checkpoint
         if start_chunk_idx > 0:
@@ -2421,23 +2849,22 @@ class SLAFConverter:
                         }
                     )
 
-                # Save checkpoint BEFORE writing chunk to avoid duplication
-                # This ensures we know exactly what was written if a failure occurs
-                if self.enable_checkpointing:
-                    should_save_checkpoint = (
-                        chunk_idx % 10 == 0  # Every 10 chunks
-                        or chunk_idx == total_chunks - 1  # Last chunk of file
+                values = np.asarray(adjusted_chunk.column("value").to_numpy())
+                if values.size:
+                    aggregates["min_value"] = min(
+                        float(aggregates["min_value"]), float(values.min())
                     )
-
-                    if should_save_checkpoint:
-                        checkpoint_data = {
-                            "status": "in_progress",
-                            "last_completed_file": file_idx,  # Current file being processed
-                            "last_completed_chunk": chunk_idx,  # Current chunk being processed
-                            "global_cell_offset": global_cell_offset,
-                            "timestamp": pd.Timestamp.now().isoformat(),
-                        }
-                        self._save_checkpoint(output_path, checkpoint_data)
+                    aggregates["max_value"] = max(
+                        float(aggregates["max_value"]), float(values.max())
+                    )
+                    values_float64 = values.astype(np.float64, copy=False)
+                    aggregates["sum_value"] = float(aggregates["sum_value"]) + float(
+                        values_float64.sum()
+                    )
+                    aggregates["sum_squared"] = float(
+                        aggregates["sum_squared"]
+                    ) + float(np.square(values_float64).sum())
+                    aggregates["count"] = int(aggregates["count"]) + values.size
 
                 # Write chunk directly to expression dataset
                 # Check if this is the first chunk of the first file in a new dataset
@@ -2469,6 +2896,21 @@ class SLAFConverter:
                         data_storage_version="2.2",
                     )
 
+                if self.enable_checkpointing and (
+                    chunk_idx % 10 == 0 or chunk_idx == total_chunks - 1
+                ):
+                    checkpoint_data = {
+                        "status": "in_progress",
+                        "last_completed_file": file_idx,
+                        "last_completed_chunk": chunk_idx,
+                        "global_cell_offset": global_cell_offset,
+                        "operation": "append"
+                        if append_schema is not None
+                        else "convert",
+                        "timestamp": pd.Timestamp.now().isoformat(),
+                    }
+                    self._save_checkpoint(output_path, checkpoint_data)
+
             except StopIteration:
                 logger.warning(f"Chunk iterator ended at chunk {chunk_idx}")
                 break
@@ -2488,6 +2930,8 @@ class SLAFConverter:
                     }
                     self._save_checkpoint(output_path, checkpoint_data)
                 raise
+
+        return aggregates
 
     @staticmethod
     def _to_scalar(val):
@@ -2780,8 +3224,73 @@ class SLAFConverter:
         )
         return True, "uint16"  # Default to uint16 for integer data
 
-    def _compact_dataset(self, output_path: str):
-        """Compact the dataset to optimize storage after writing"""
+    @staticmethod
+    def _cleanup_lance_table_versions(
+        table_path: str,
+        *,
+        table_name: str,
+    ) -> None:
+        """Retain only the current version of one finalized Lance table."""
+        cleanup = lance.dataset(table_path).cleanup_old_versions(retain_versions=1)
+        logger.info(
+            "  {} version cleanup: old_versions_removed={} files_removed={} "
+            "bytes_removed={}",
+            table_name,
+            cleanup.old_versions,
+            cleanup.data_files_removed,
+            cleanup.bytes_removed,
+        )
+
+    def _compact_lance_table(
+        self,
+        table_path: str,
+        *,
+        table_name: str,
+        target_rows_per_fragment: int,
+        compaction_mode: str,
+    ) -> None:
+        """Compact one Lance table when its plan contains rewrite tasks."""
+        dataset = lance.dataset(table_path)
+        options = CompactionOptions(
+            target_rows_per_fragment=target_rows_per_fragment,
+            compaction_mode=compaction_mode,
+        )
+        plan = Compaction.plan(dataset, options)
+        task_count = plan.num_tasks()
+        if task_count == 0:
+            logger.info("  {} table already satisfies compaction target", table_name)
+            return
+
+        before_fragments = len(list(dataset.get_fragments()))
+        row_count = dataset.count_rows()
+        start = time.perf_counter()
+        metrics = Compaction.execute(dataset, options)
+        after_fragments = len(list(dataset.get_fragments()))
+        logger.info(
+            "  {} table compacted in {:.3f}s: tasks={} rows={} fragments={}->{} "
+            "mean_rows_per_fragment={:.0f} files_removed={} files_added={} "
+            "fragments_removed={} fragments_added={}",
+            table_name,
+            time.perf_counter() - start,
+            task_count,
+            row_count,
+            before_fragments,
+            after_fragments,
+            row_count / max(after_fragments, 1),
+            metrics.files_removed,
+            metrics.files_added,
+            metrics.fragments_removed,
+            metrics.fragments_added,
+        )
+
+    def _compact_dataset(
+        self,
+        output_path: str,
+        *,
+        expression_target_rows_per_fragment: int = 25_000_000,
+        compaction_mode: str = "try_binary_copy",
+    ) -> None:
+        """Compact expression and metadata tables after writing."""
         logger.info("Compacting dataset for optimal storage...")
 
         try:
@@ -2789,11 +3298,12 @@ class SLAFConverter:
             expression_path = f"{output_path}/expression.lance"
             if self._path_exists(expression_path):
                 logger.info("  Compacting expression table...")
-                dataset = lance.dataset(expression_path)
-                dataset.optimize.compact_files(
-                    target_rows_per_fragment=1024 * 1024
-                )  # 1M rows per fragment
-                logger.info("  Expression table compacted!")
+                self._compact_lance_table(
+                    expression_path,
+                    table_name="expression",
+                    target_rows_per_fragment=expression_target_rows_per_fragment,
+                    compaction_mode=compaction_mode,
+                )
             else:
                 logger.warning("  Expression table not found, skipping compaction")
 
@@ -2802,11 +3312,12 @@ class SLAFConverter:
                 table_path = f"{output_path}/{table_name}.lance"
                 if self._path_exists(table_path):
                     logger.info(f"  Compacting {table_name} table...")
-                    dataset = lance.dataset(table_path)
-                    dataset.optimize.compact_files(
-                        target_rows_per_fragment=100000
-                    )  # 100K rows per fragment for metadata
-                    logger.info(f"  {table_name} table compacted!")
+                    self._compact_lance_table(
+                        table_path,
+                        table_name=table_name,
+                        target_rows_per_fragment=100_000,
+                        compaction_mode=compaction_mode,
+                    )
                 else:
                     logger.warning(
                         f"  {table_name} table not found, skipping compaction"
@@ -3575,6 +4086,58 @@ class SLAFConverter:
             logger.info(f"Detected {len(obsm_keys)} multi-file obsm keys: {obsm_keys}")
         return obsm_keys, dimensions
 
+    def _obsm_schema(
+        self,
+        adata,
+        n_cells: int,
+    ) -> tuple[list[str], dict[str, int]]:
+        """Return valid two-dimensional obsm keys and their widths."""
+        keys: list[str] = []
+        dimensions: dict[str, int] = {}
+        if adata is None or not hasattr(adata, "obsm"):
+            return keys, dimensions
+
+        for key, embedding in adata.obsm.items():
+            shape = getattr(embedding, "shape", None)
+            if not self._valid_multi_file_2d_shape(
+                "obsm",
+                key,
+                "AnnData",
+                shape,
+                expected_rows=n_cells,
+            ):
+                continue
+            assert shape is not None
+            keys.append(key)
+            dimensions[key] = int(shape[1])
+        return keys, dimensions
+
+    def _add_obsm_columns(
+        self,
+        cell_metadata_table: pa.Table,
+        obsm: Any,
+        obsm_keys: list[str],
+        obsm_dimensions: dict[str, int],
+        n_cells: int,
+    ) -> pa.Table:
+        """Add fixed-size obsm vectors to a cells metadata table."""
+        for key in obsm_keys:
+            vectors = np.asarray(obsm[key], dtype=np.float32)
+            expected_shape = (n_cells, int(obsm_dimensions[key]))
+            if vectors.shape != expected_shape:
+                raise ValueError(
+                    f"obsm '{key}' has shape {vectors.shape}; expected {expected_shape}."
+                )
+            vector_array = pa.FixedSizeListArray.from_arrays(
+                pa.array(vectors.reshape(-1), type=pa.float32()),
+                expected_shape[1],
+            )
+            cell_metadata_table = cell_metadata_table.append_column(
+                key,
+                vector_array,
+            )
+        return cell_metadata_table
+
     def _add_multi_file_obsm_columns(
         self,
         file_path: str,
@@ -3590,20 +4153,17 @@ class SLAFConverter:
         adata = sc.read_h5ad(file_path, backed="r")
         try:
             for key in obsm_keys:
-                n_dims = int(obsm_dimensions[key])
-                if key in adata.obsm and self._valid_multi_file_2d_shape(
-                    "obsm",
-                    key,
-                    file_path,
-                    getattr(adata.obsm[key], "shape", None),
-                    expected_rows=n_cells,
-                ):
+                if key in adata.obsm:
                     vectors = np.asarray(adata.obsm[key], dtype=np.float32)
                 else:
-                    vectors = np.full((n_cells, n_dims), np.nan, dtype=np.float32)
+                    vectors = np.full(
+                        (n_cells, int(obsm_dimensions[key])),
+                        np.nan,
+                        dtype=np.float32,
+                    )
                 vector_array = pa.FixedSizeListArray.from_arrays(
                     pa.array(vectors.reshape(-1), type=pa.float32()),
-                    n_dims,
+                    int(obsm_dimensions[key]),
                 )
                 cell_metadata_table = cell_metadata_table.append_column(
                     key,
@@ -3988,14 +4548,13 @@ class SLAFConverter:
         # Reset index to avoid __index_level_0__ column in Arrow table
         result_df = result_df.reset_index(drop=True)
 
-        # Sanitize column names: replace '.' with '_' for Lance compatibility
-        # Lance doesn't allow '.' in field names
-        column_mapping = {
-            col: col.replace(".", "_") for col in result_df.columns if "." in col
-        }
-        if column_mapping:
-            result_df = result_df.rename(columns=column_mapping)
-            logger.debug(f"Sanitized column names: {column_mapping}")
+        original_columns = [str(column) for column in result_df.columns]
+        result_df.columns = _sanitize_metadata_column_names(original_columns)
+        if list(result_df.columns) != original_columns:
+            logger.debug(
+                "Sanitized metadata column names: {}",
+                dict(zip(original_columns, result_df.columns, strict=False)),
+            )
 
         table = pa.table(result_df)
         table = self._cast_table_string_columns_to_utf8(table, [entity_id_col])
@@ -4039,7 +4598,12 @@ class SLAFConverter:
                     data_storage_version="2.2",
                 )
 
-    def _create_indices(self, output_path: str):
+    def _create_indices(
+        self,
+        output_path: str,
+        *,
+        create_expression_indices: bool = True,
+    ):
         """Create optimal indices for SLAF tables with column existence checks"""
         logger.info("Creating indices for optimal query performance...")
 
@@ -4052,10 +4616,11 @@ class SLAFConverter:
                 # Only create metadata indices for larger datasets
             ],
             "genes": ["gene_id", "gene_integer_id"],
-            "expression": [
-                "cell_integer_id",
-                "gene_integer_id",
-            ],  # Only integer indices for efficiency
+            "expression": (
+                ["cell_integer_id", "gene_integer_id"]
+                if create_expression_indices
+                else []
+            ),
             "cellsxcells": ["cell_integer_id_i"],
         }
 
@@ -4065,9 +4630,19 @@ class SLAFConverter:
             if self._path_exists(table_path):
                 dataset = lance.dataset(table_path)
                 schema = dataset.schema
+                indexed_fields = {
+                    field
+                    for index in dataset.describe_indices()
+                    for field in index.field_names
+                }
 
                 for column in desired_columns:
                     if column in schema.names:
+                        if column in indexed_fields:
+                            logger.info(
+                                f"  Skipping existing index on {table_name}.{column}"
+                            )
+                            continue
                         logger.info(f"  Creating index on {table_name}.{column}")
                         dataset.create_scalar_index(column, "BTREE")
 

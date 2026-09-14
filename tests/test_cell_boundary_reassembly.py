@@ -12,9 +12,16 @@ from pathlib import Path
 import lance
 import polars as pl
 import pytest
+import torch
 
-from slaf.ml.datasets import PrefetchBatchProcessor, RawPrefetchBatch
+from slaf.ml.datasets import (
+    PrefetchBatchProcessor,
+    RawPrefetchBatch,
+    SLAFIterableDataset,
+    TokenizedPrefetchBatch,
+)
 from slaf.ml.samplers import RandomShuffle
+from slaf.ml.tokenizers import ScGPTTokenizer
 
 pytestmark = [pytest.mark.slaf_array]
 
@@ -163,8 +170,9 @@ def test_mos_exhaustion_flushes_remaining_partial_cells(slaf_mos_boundary_reasse
             "value": [1.0] * 6,
         }
     )
-    for i in range(len(processor.generator_active)):
-        processor.generator_active[i] = False
+    processor.fragment_generators.clear()
+    processor.generator_last_cells.clear()
+    processor.pending_fragment_indices.clear()
     processor.partial_cell_data = {1: partial}
 
     batch = processor.load_prefetch_batch()
@@ -265,3 +273,137 @@ def test_cross_fragment_slaf_one_epoch_raw_matches_cell_start_index_mos(
     )
     batches = _collect_raw_prefetch_epoch(processor)
     _assert_raw_epoch_matches_cell_start_index(slaf_mos_boundary_reassembly, batches)
+
+
+def test_mos_carries_short_raw_batch_into_next_prefetch(
+    slaf_mos_boundary_reassembly,
+):
+    """Prefetch boundaries must not create short model batches."""
+    slaf = slaf_mos_boundary_reassembly
+    expression = pl.from_arrow(slaf.expression.to_table())
+    scanner_batches = [
+        expression.filter(pl.col("cell_integer_id").is_between(start, start + 2))
+        .to_arrow()
+        .to_batches()[0]
+        for start in (0, 3)
+    ]
+    processor = PrefetchBatchProcessor(
+        slaf_array=slaf,
+        shuffle=RandomShuffle(),
+        tokenizer=None,
+        raw_mode=True,
+        use_mixture_of_scanners=True,
+        n_scanners=1,
+        prefetch_batch_size=1000,
+        batch_size=2,
+        seed=42,
+        n_epochs=1,
+        verbose=False,
+    )
+    processor.fragment_generators = {0: iter(scanner_batches)}
+    processor.generator_last_cells = {0: None}
+    processor.pending_fragment_indices.clear()
+
+    batches = _collect_raw_prefetch_epoch(processor)
+    batch_sizes = [
+        batch_df.get_column("cell_integer_id").n_unique()
+        for batch in batches
+        for batch_df in batch.batch_dfs
+    ]
+
+    assert batch_sizes == [2, 2, 2]
+    _assert_raw_epoch_matches_cell_start_index(slaf, batches)
+
+
+def test_mos_carries_short_tokenized_batch_into_next_prefetch(
+    slaf_mos_boundary_reassembly,
+):
+    """Tokenized prefetch output must contain only complete model batches."""
+    slaf = slaf_mos_boundary_reassembly
+    expression = pl.from_arrow(slaf.expression.to_table())
+    scanner_batches = [
+        expression.filter(pl.col("cell_integer_id").is_between(start, start + 2))
+        .to_arrow()
+        .to_batches()[0]
+        for start in (0, 3)
+    ]
+    processor = PrefetchBatchProcessor(
+        slaf_array=slaf,
+        shuffle=RandomShuffle(),
+        tokenizer=ScGPTTokenizer(slaf),
+        raw_mode=False,
+        use_mixture_of_scanners=True,
+        n_scanners=1,
+        prefetch_batch_size=1000,
+        batch_size=2,
+        seed=42,
+        n_epochs=1,
+        verbose=False,
+    )
+    processor.fragment_generators = {0: iter(scanner_batches)}
+    processor.generator_last_cells = {0: None}
+    processor.pending_fragment_indices.clear()
+
+    batches = []
+    while True:
+        try:
+            batches.append(processor.load_prefetch_batch())
+        except StopIteration:
+            break
+
+    assert [len(batch.cell_integer_ids) for batch in batches] == [2, 4]
+    assert sorted(
+        cell_id for batch in batches for cell_id in batch.cell_integer_ids
+    ) == list(range(6))
+
+
+def test_iterable_rebatches_filtered_tokenized_prefetches():
+    """Post-tokenization cell filtering must not leak short model batches."""
+
+    class FakePrefetcher:
+        def __init__(self):
+            self.finished = False
+            self.batches = [
+                TokenizedPrefetchBatch(
+                    batch_id=batch_id,
+                    epoch=0,
+                    input_ids=torch.ones((3, 4), dtype=torch.long),
+                    attention_mask=torch.ones((3, 4), dtype=torch.bool),
+                    values=torch.ones((3, 4)),
+                    cell_integer_ids=list(range(start, start + 3)),
+                    load_time=0.01,
+                    window_time=0.02,
+                    tokenize_time=0.03,
+                )
+                for batch_id, start in enumerate((0, 3))
+            ]
+
+        def get_batch(self):
+            if self.batches:
+                return self.batches.pop(0)
+            self.finished = True
+            return None
+
+    dataset = object.__new__(SLAFIterableDataset)
+    dataset.prefetcher = FakePrefetcher()
+    dataset.batch_size = 2
+    dataset.n_epochs = 1
+    dataset.verbose = False
+
+    batches = list(dataset)
+
+    assert [len(batch["cell_ids"]) for batch in batches] == [2, 2, 2]
+    assert torch.cat(
+        [batch["cell_ids"] for batch in batches]
+    ).sort().values.tolist() == list(range(6))
+    assert batches[0]["producer_timings_ms"] == {
+        "lance_loading_ms": 10.0,
+        "joint_tokenizer_window_ms": 20.0,
+        "tokenization_ms": 30.0,
+    }
+    assert batches[1]["producer_timings_ms"] == {
+        "lance_loading_ms": 10.0,
+        "joint_tokenizer_window_ms": 20.0,
+        "tokenization_ms": 30.0,
+    }
+    assert "producer_timings_ms" not in batches[2]

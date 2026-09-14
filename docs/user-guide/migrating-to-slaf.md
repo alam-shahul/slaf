@@ -109,6 +109,30 @@ adata = sc.read_h5ad("data.h5ad")
 converter.convert_anndata(adata, "output.slaf")
 ```
 
+### Streaming H5AD conversion
+
+When transformed H5AD files are too large to retain together, build the SLAF one
+file at a time and remove each staging file only after its conversion succeeds:
+
+```python
+from pathlib import Path
+
+from slaf.data import SLAFConverter
+
+converter = SLAFConverter(create_indices=False, compact_after_write=False)
+for staging_path in map(Path, transformed_h5ad_paths):
+    converter.append(str(staging_path), "output.slaf")
+    staging_path.unlink()
+
+converter.finalize("output.slaf", create_indices=True, compact=False)
+```
+
+H5AD append requires the same ordered gene vocabulary, cell metadata columns,
+`obsm` keys and widths, and `obsp` keys as the initial file. Pairwise matrices
+are appended as independent diagonal blocks with globally offset cell IDs.
+The first `append()` call creates a missing destination from one input file.
+Initialize multi-file or directory inputs with `convert()` instead.
+
 ## Large Datasets
 
 For large datasets (>100k cells), you can optimize performance:

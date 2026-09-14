@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -710,13 +711,19 @@ class SLAFArray:
             cumsum = cumsum.cast(pl.Int64)
             self._cell_start_index = pl.concat([pl.Series([0], dtype=pl.Int64), cumsum])
 
+        validation_start = time.perf_counter()
         self._validate_cell_row_index(
             self._obs["cell_integer_id"].to_numpy(),
             self._cell_start_index.to_numpy(),
             expression_row_count=expression_row_count,
         )
+        logger.info(
+            "Validated cell expression-row index in {:.3f}s",
+            time.perf_counter() - validation_start,
+        )
 
         # Restore dtypes for obs using polars
+        dtype_start = time.perf_counter()
         obs_dtypes = self.config.get("obs_dtypes", {})
         for col, dtype_info in obs_dtypes.items():
             if col in self._obs.columns:
@@ -743,9 +750,18 @@ class SLAFArray:
                     # Map pandas dtypes to polars dtypes
                     polars_dtype = self._map_pandas_to_polars_dtype(dtype_info["dtype"])
                     self._var = self._var.with_columns(pl.col(col).cast(polars_dtype))
+        logger.info(
+            "Restored configured metadata dtypes in {:.3f}s",
+            time.perf_counter() - dtype_start,
+        )
 
         # Infer categorical columns if not in config
+        categorical_start = time.perf_counter()
         self._infer_categorical_columns()
+        logger.info(
+            "Inferred categorical metadata columns in {:.3f}s",
+            time.perf_counter() - categorical_start,
+        )
 
     @staticmethod
     def _validate_cell_row_index(
